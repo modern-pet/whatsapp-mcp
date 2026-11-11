@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -10,15 +11,20 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
+	"rsc.io/qr"
 
 	"bytes"
 
@@ -774,6 +780,32 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for showing the pairing QR code in a browser (useful when running in the background)
+	http.HandleFunc("/qr", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if client.IsLoggedIn() {
+			fmt.Fprint(w, `<html><body style="font-family:sans-serif;text-align:center"><h2>WhatsApp bridge is logged in.</h2></body></html>`)
+			return
+		}
+
+		pairing.request()
+		body := "<p>Waiting for a QR code...</p>"
+		if code := pairing.code(); code != "" {
+			img, err := qr.Encode(code, qr.L)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Failed to render QR code: %v", err), http.StatusInternalServerError)
+				return
+			}
+			img.Scale = 8
+			body = fmt.Sprintf(`<img src="data:image/png;base64,%s" alt="WhatsApp QR code">`, base64.StdEncoding.EncodeToString(img.PNG()))
+		}
+		fmt.Fprintf(w, `<html><head><meta http-equiv="refresh" content="5"><title>WhatsApp login</title></head>
+<body style="font-family:sans-serif;text-align:center">
+<h2>Link the WhatsApp bridge</h2>%s
+<p>On your phone: WhatsApp &rarr; Settings &rarr; Linked devices &rarr; Link a device, then scan this code.</p>
+</body></html>`, body)
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -849,42 +881,26 @@ func main() {
 			logger.Infof("Connected to WhatsApp")
 
 		case *events.LoggedOut:
-			logger.Warnf("Device logged out, please scan QR code to log in again")
+			logger.Warnf("Device logged out (%s), restarting to pair again", v.Reason)
+			// whatsmeow deletes the session concurrently with this event; give it time to finish
+			// so the next start goes straight into pairing mode
+			for i := 0; i < 20 && client.Store.ID != nil; i++ {
+				time.Sleep(500 * time.Millisecond)
+			}
+			// Exit non-zero so a supervisor (launchd/systemd) restarts the bridge
+			os.Exit(1)
 		}
 	})
 
-	// Create channel to track connection success
-	connected := make(chan bool, 1)
+	// Start REST API server before connecting, so the /qr page is available while pairing
+	port := bridgePort(logger)
+	startRESTServer(client, messageStore, port)
 
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
 		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-
-		// Print QR code for pairing with phone
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
-			}
-		}
-
-		// Wait for connection
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
-			return
-		}
+		pairDevice(client, logger, fmt.Sprintf("http://localhost:%d/qr", port))
+		fmt.Println("\nSuccessfully connected and authenticated!")
 	} else {
 		// Already logged in, just connect
 		err = client.Connect()
@@ -892,7 +908,6 @@ func main() {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
-		connected <- true
 	}
 
 	// Wait a moment for connection to stabilize
@@ -904,9 +919,6 @@ func main() {
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -920,6 +932,119 @@ func main() {
 	fmt.Println("Disconnecting...")
 	// Disconnect client
 	client.Disconnect()
+}
+
+// bridgePort returns the REST API port: WHATSAPP_BRIDGE_PORT if set, otherwise 8080.
+// Give each bridge its own port when running several (one per WhatsApp number).
+func bridgePort(logger waLog.Logger) int {
+	if p := os.Getenv("WHATSAPP_BRIDGE_PORT"); p != "" {
+		port, err := strconv.Atoi(p)
+		if err == nil {
+			return port
+		}
+		logger.Warnf("Invalid WHATSAPP_BRIDGE_PORT %q, using 8080", p)
+	}
+	return 8080
+}
+
+// pairingState holds the current pairing QR code so the /qr page can show it
+type pairingState struct {
+	mu      sync.Mutex
+	current string
+	wanted  chan struct{}
+}
+
+var pairing = &pairingState{wanted: make(chan struct{}, 1)}
+
+func (p *pairingState) setCode(code string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.current = code
+}
+
+func (p *pairingState) code() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.current
+}
+
+// request signals that someone is waiting for a QR code
+func (p *pairingState) request() {
+	select {
+	case p.wanted <- struct{}{}:
+	default:
+	}
+}
+
+// pairDevice links the bridge to a phone by QR code, blocking until pairing succeeds.
+// Codes are printed to the terminal and served at qrPageURL. When a batch of codes
+// expires, a new one is only started once someone opens the QR page again.
+func pairDevice(client *whatsmeow.Client, logger waLog.Logger, qrPageURL string) {
+	title := "WhatsApp bridge needs login"
+	// Name the clone in the title so notifications from several bridges can be told apart
+	if wd, err := os.Getwd(); err == nil {
+		title = fmt.Sprintf("WhatsApp bridge (%s) needs login", filepath.Base(filepath.Dir(wd)))
+	}
+	notify(title, "Scan the QR code at "+qrPageURL, qrPageURL)
+	for {
+		qrChan, _ := client.GetQRChannel(context.Background())
+		if err := client.Connect(); err != nil {
+			logger.Errorf("Failed to connect: %v", err)
+			time.Sleep(30 * time.Second)
+			continue
+		}
+
+		for evt := range qrChan {
+			switch evt.Event {
+			case "code":
+				pairing.setCode(evt.Code)
+				fmt.Printf("\nScan this QR code with your WhatsApp app (or open %s):\n", qrPageURL)
+				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+			case "success":
+				pairing.setCode("")
+				return
+			default:
+				logger.Warnf("Pairing ended: %s", evt.Event)
+			}
+		}
+
+		pairing.setCode("")
+		logger.Infof("QR code expired, open %s to get a new one", qrPageURL)
+		<-pairing.wanted
+	}
+}
+
+// notify shows a desktop notification on macOS and, if WHATSAPP_NOTIFY_URL is set,
+// POSTs the message there (e.g. an https://ntfy.sh topic) so it can reach your phone.
+func notify(title, message, link string) {
+	if runtime.GOOS == "darwin" {
+		var err error
+		if notifier, lookErr := exec.LookPath("terminal-notifier"); lookErr == nil {
+			// terminal-notifier can open the link when the notification is clicked
+			err = exec.Command(notifier, "-title", title, "-message", message, "-open", link, "-sound", "default").Run()
+		} else {
+			script := fmt.Sprintf("display notification %q with title %q sound name \"default\"", message, title)
+			err = exec.Command("osascript", "-e", script).Run()
+		}
+		if err != nil {
+			fmt.Printf("Failed to show desktop notification: %v\n", err)
+		}
+	}
+
+	if notifyURL := os.Getenv("WHATSAPP_NOTIFY_URL"); notifyURL != "" {
+		req, err := http.NewRequest(http.MethodPost, notifyURL, strings.NewReader(message))
+		if err != nil {
+			fmt.Printf("Failed to create notification request: %v\n", err)
+			return
+		}
+		req.Header.Set("Title", title)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			fmt.Printf("Failed to send notification: %v\n", err)
+			return
+		}
+		resp.Body.Close()
+	}
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info

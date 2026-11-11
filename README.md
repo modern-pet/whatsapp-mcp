@@ -46,6 +46,32 @@ Here's an example of what you can do when it's connected to Claude.
 
    After approximately 20 days, you will might need to re-authenticate.
 
+   **Running in the background (macOS):** instead of keeping a terminal open, install the bridge as a LaunchAgent:
+
+   ```bash
+   cd whatsapp-bridge
+   ./install-launchd.sh            # ./install-launchd.sh uninstall to remove
+   ```
+
+   It starts at login, restarts if it exits, and logs to `whatsapp-bridge/whatsapp.log`. When the bridge needs to be linked (first run or after being logged out), you get a desktop notification and the QR code is served at [http://localhost:8080/qr](http://localhost:8080/qr). Install `terminal-notifier` (`brew install terminal-notifier`) to open that page by clicking the notification. To also get alerted on your phone, set `WHATSAPP_NOTIFY_URL` to an [ntfy](https://ntfy.sh) topic URL before running the install script.
+
+   **Multiple WhatsApp numbers:** clone the repo once per number (each clone keeps its own login and messages in `whatsapp-bridge/store/`) and give each bridge its own port:
+
+   ```bash
+   cd ~/whatsapp-mcp-work/whatsapp-bridge
+   WHATSAPP_BRIDGE_PORT=8081 ./install-launchd.sh
+   ```
+
+   The port is remembered when you reinstall. In your MCP config, add one server per clone under a different name, pointing at that clone's `whatsapp-mcp-server` and passing the same port:
+
+   ```json
+   "whatsapp-work": {
+     "command": "{{PATH_TO_UV}}",
+     "args": ["--directory", "{{PATH_TO_WORK_CLONE}}/whatsapp-mcp-server", "run", "main.py"],
+     "env": { "WHATSAPP_BRIDGE_PORT": "8081" }
+   }
+   ```
+
 3. **Connect to the MCP server**
 
    Copy the below json with the appropriate {{PATH}} values:

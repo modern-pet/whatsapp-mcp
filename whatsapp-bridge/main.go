@@ -672,10 +672,9 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
+	// Keep the query string: it carries the signed oh/oe parameters, and whatsmeow appends
+	// "&hash=...&mms-type=..." to the direct path, so without "?..." the URL is invalid (HTTP 403).
 	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
 
 	// Create proper direct path format
 	return "/" + pathPart
